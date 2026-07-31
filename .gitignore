@@ -1,0 +1,43 @@
+# ============================================================
+# 個資與密鑰 —— 絕對不上傳,只留本機
+# 註:.gitignore 的 # 只有行首才是註解,不能寫在 pattern 後面
+# ============================================================
+
+# 券商 API key、憑證密碼、身分證字號
+.env
+# FinMind token
+finmind_token.json
+# 內含交割戶餘額、負債金額(範本見 config.example.yaml)
+config.yaml
+# 實際持股(範本見 positions_manual.example.csv)
+positions_manual.csv
+# 完整持股與淨值歷史
+networth.db
+# 券商憑證檔
+*.pfx
+*.p12
+
+# 券商 SDK 日誌(內含帳號、分公司代號、姓名)
+log/
+*.log
+
+# 券商 SDK 安裝檔(不可轉散布,各自向券商申請)
+*.whl
+fubon_neo-*/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 自動產生的快取(會自己重建)
+stock_names.json
+
+# 本機工具設定
+.claude/settings.local.json
+
+# 暫存檔
+_*.txt
+_*.json
+*.tmp

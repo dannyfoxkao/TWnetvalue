@@ -1,0 +1,12 @@
+streamlit>=1.58
+pandas>=2.2
+plotly>=6.0
+requests>=2.32
+PyYAML>=6.0
+python-dotenv>=1.0
+# --- 券商 API(申請好再裝,裝了才把 config.yaml 對應帳戶 enabled 改 true)---
+# shioaji>=1.2        # 永豐:pip install shioaji(PyPI 有上架)
+# fubon-neo 不在 PyPI 上,不能 pip install fubon-neo。
+# 要先到 https://www.fbs.com.tw/TradeAPI/en/docs/download/download-sdk/
+# 下載對應 Python 版本的 .whl(如 fubon_neo-2.2.8-cp311-abi3-win_amd64.whl),
+# 再用 pip install <下載的檔名>.whl 安裝。

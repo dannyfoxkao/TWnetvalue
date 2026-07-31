@@ -1,0 +1,70 @@
+# ============================================================
+# TWnetvalue 設定檔
+# 淨值 = 各帳戶證券市值合計 + 期貨帳戶權益數 + 現金 − 負債
+# ============================================================
+
+# FinMind token(抓收盤價與大盤基準用)
+# 到 https://finmindtrade.com/ 免費註冊拿 token,存成 finmind_token.json:
+#     { "api_token": "你的 token" }
+finmind_token_file: finmind_token.json
+
+# ---------- 帳戶 ----------
+# 每個帳戶一個 adapter。API 憑證放 .env,不要寫在這裡。
+# 先用 manual 跑起來,之後申請到券商 API 再把對應帳戶 enabled 改 true。
+accounts:
+
+  # 永豐 Shioaji API
+  # .env 需要:SHIOAJI_API_KEY / SHIOAJI_SECRET_KEY
+  # 申請時務必勾「帳務」+「正式環境」權限,否則查庫存會 401。
+  # 新 key 第一次用正式環境前,永豐規定要先跑 shioaji_test_flow.py 完成模擬測試。
+  sinopac:
+    type: shioaji
+    enabled: false
+
+  # 富邦 Neo API
+  # .env 需要:FUBON_ID / FUBON_PASSWORD / FUBON_CERT_PATH / FUBON_CERT_PASSWORD
+  fubon:
+    type: fubon
+    enabled: false
+
+  # 富邦期貨帳戶(保證金帳戶,權益數已含未實現損益)
+  # 沿用同一組 FUBON_* 憑證。
+  #
+  # 期貨部位以標的「實質價值」計入投資部位(而非保證金):
+  #   實質價值 = underlying 收盤 × multiplier × 淨口數(口數自動從帳戶抓)
+  #   帳戶權益數扣掉實質價值後的餘額,歸類為現金。
+  # 下例為小型台灣50期貨:標的 0050、每口 1000 單位。
+  # 換成別的商品要同步改 underlying / multiplier。
+  fubon_futures:
+    type: fubon_futures
+    enabled: false
+    underlying: "0050"
+    multiplier: 1000
+
+  # 手動持股表(沒有券商 API 時用這個)
+  # 只需要維護代號和股數,收盤價每天自動抓。
+  manual:
+    type: manual
+    enabled: true
+    positions_file: positions_manual.csv
+
+# ---------- 現金 ----------
+# 有變動時手動改(交割戶餘額、其他銀行戶等),單位:元
+# 改完跑 python update_cash.py 就好,不用重跑完整快照。
+cash:
+  - name: 交割戶
+    amount: 0
+
+# ---------- 負債 ----------
+# 槓桿、質押、貸款等,單位:元
+debt:
+  - name: 質押借款
+    amount: 0
+
+# ---------- 基準 ----------
+# 淨值曲線要疊的比較基準(FinMind stock_id)
+benchmarks:
+  - id: TAIEX
+    name: 加權指數
+  - id: "0050"
+    name: 元大台灣50
