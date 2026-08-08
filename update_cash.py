@@ -28,26 +28,35 @@ def load_cash_debt():
 
 def update_one(conn, date, config_cash, debt):
     row = conn.execute(
-        "SELECT market_value, net_value FROM totals WHERE date=?", (date,)
+        "SELECT market_value, net_value, COALESCE(unsettled, 0),"
+        " COALESCE(broker_cash, 0) FROM totals WHERE date=?",
+        (date,),
     ).fetchone()
     if row is None:
         print(f"[略過] {date} 沒有快照資料")
         return
-    mv, old_nv = row
-    # 現金 = config 手動現金 + 該日期貨(權益數 − 實質價值)= free_cash。
-    # 舊資料 free_cash 為 NULL(當天市值已含完整期貨權益),視為 0 不會重複計算,
-    # 兩種情況淨值都正確。
+    mv, old_nv, unsettled, broker_cash = row
+    # 現金 = 券商交割戶(快照時自動抓,沿用不重查) + config 手動現金
+    #        + 該日期貨(權益數 − 實質價值)。
+    # 舊資料 broker_cash / free_cash 為 NULL 時視為 0,不會重複計算。
     futures_free = conn.execute(
         "SELECT COALESCE(SUM(free_cash), 0) FROM futures_snapshots WHERE date=?",
         (date,),
     ).fetchone()[0]
-    cash = config_cash + futures_free
-    new_nv = mv + cash - debt
+    cash = broker_cash + config_cash + futures_free
+    new_nv = mv + cash + unsettled - debt
     conn.execute(
         "UPDATE totals SET cash=?, debt=?, net_value=? WHERE date=?",
         (cash, debt, new_nv, date),
     )
-    extra = f"(含期貨閒置 {futures_free:,.0f})" if futures_free else ""
+    parts = []
+    if broker_cash:
+        parts.append(f"交割戶 {broker_cash:,.0f}")
+    if futures_free:
+        parts.append(f"期貨閒置 {futures_free:,.0f}")
+    if unsettled:
+        parts.append(f"未交割 {unsettled:+,.0f}")
+    extra = f"({', '.join(parts)})" if parts else ""
     print(f"{date}: 現金 {cash:,.0f}{extra} 負債 {debt:,.0f} | "
           f"淨值 {old_nv:,.0f} → {new_nv:,.0f}")
 

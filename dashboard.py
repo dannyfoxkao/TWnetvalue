@@ -95,8 +95,13 @@ c3.metric("最大回撤", f"{drawdown.min():.2f}%")
 c4.metric("目前回撤", f"{drawdown.iloc[-1]:.2f}%")
 c5.metric("現金比重", f"{cash_pct:.1f}%")
 c6.metric("槓桿比(負債/淨值)", f"{leverage:.1f}%")
-st.caption(f"最後更新:{latest['date']}|市值 {latest['market_value']:,.0f}"
-           f"|現金 {latest['cash']:,.0f}|負債 {latest['debt']:,.0f}")
+_unsettled = latest.get("unsettled") or 0
+_cap = (f"最後更新:{latest['date']}|投資部位 {latest['market_value']:,.0f}"
+        f"|現金 {latest['cash']:,.0f}")
+if _unsettled:
+    _cap += f"|未交割款(T+2) {_unsettled:+,.0f}"
+_cap += f"|負債 {latest['debt']:,.0f}"
+st.caption(_cap)
 
 # ---------- 淨值曲線 ----------
 fig = go.Figure(layout=LAYOUT)

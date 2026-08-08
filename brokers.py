@@ -1,10 +1,19 @@
-"""帳戶 adapter 層:每個 adapter 回傳該帳戶的持股清單。
+"""帳戶 adapter 層。
 
-回傳格式統一為 list[dict]:
-    {"code": "2330", "shares": 1000, "price": 1080.0 或 None, "market_value": ... 或 None}
+每個證券 adapter 回傳 dict:
+    {
+      "positions": [ {"code","shares","price","market_value"}, ... ],
+      "settlement_cash": 交割戶餘額(抓不到就 0),
+      "unsettled": 未交割款淨額(應收為正、應付為負,抓不到就 0),
+    }
 price/market_value 為 None 時,由 snapshot.py 用 FinMind 收盤價補上。
+
+未交割款是台股 T+2 制度的必要修正:賣出當天持股就從庫存消失、但錢兩個
+交易日後才進交割戶;買進當天持股就進庫存、但錢還沒扣。中間這段如果不
+補上未交割款,淨值會被低估(賣)或高估(買)。
 """
 import csv
+import datetime as dt
 import os
 from pathlib import Path
 
@@ -24,7 +33,7 @@ def fetch_manual(acc_cfg: dict):
                 "price": None,
                 "market_value": None,
             })
-    return positions
+    return {"positions": positions, "settlement_cash": 0.0, "unsettled": 0.0}
 
 
 def fetch_shioaji(acc_cfg: dict):
@@ -67,7 +76,26 @@ def fetch_shioaji(acc_cfg: dict):
                 "price": last,
                 "market_value": last * shares if last else None,
             })
-        return positions
+
+        # 交割戶餘額(自動抓,不用手動維護)
+        settlement_cash = 0.0
+        try:
+            bal = api.account_balance()
+            settlement_cash = float(getattr(bal, "acc_balance", 0) or 0)
+        except Exception as e:
+            print(f"  [警告] 永豐交割戶餘額抓取失敗,以 0 計:{e}")
+
+        # 未交割款:只算 T+1、T+2(T+0 當天已完成交割,餘額已反映,算了會重複)
+        unsettled = 0.0
+        try:
+            for s in api.settlements(api.stock_account):
+                if int(getattr(s, "T", 0)) > 0:
+                    unsettled += float(getattr(s, "amount", 0) or 0)
+        except Exception as e:
+            print(f"  [警告] 永豐未交割款抓取失敗,以 0 計:{e}")
+
+        return {"positions": positions, "settlement_cash": settlement_cash,
+                "unsettled": unsettled}
     finally:
         # logout 失敗只印警告,不能讓它蓋掉上面 try 區塊真正的錯誤
         # (finally 裡的例外會取代 try 裡傳出來的例外)
@@ -127,7 +155,36 @@ def fetch_fubon(acc_cfg: dict):
                 "price": None,          # 用 FinMind 收盤價統一計價
                 "market_value": None,
             })
-        return positions
+
+        # 交割戶餘額(自動抓,不用手動維護)
+        settlement_cash = 0.0
+        try:
+            br = sdk.accounting.bank_remain(account)
+            if br.is_success:
+                settlement_cash = float(getattr(br.data, "balance", 0) or 0)
+        except Exception as e:
+            print(f"  [警告] 富邦交割戶餘額抓取失敗,以 0 計:{e}")
+
+        # 未交割款:只算交割日尚未到的(已交割的餘額已反映,算了會重複)。
+        # total_settlement_amount 負數=應付(買)、正數=應收(賣);
+        # 沒成交的日期整筆欄位都是 None,要略過。
+        unsettled = 0.0
+        try:
+            st = sdk.accounting.query_settlement(account, "3d")
+            if st.is_success:
+                today = dt.date.today()
+                for d in getattr(st.data, "details", []) or []:
+                    sd = getattr(d, "settlement_date", None)
+                    amt = getattr(d, "total_settlement_amount", None)
+                    if not sd or amt is None:
+                        continue
+                    if dt.datetime.strptime(sd, "%Y/%m/%d").date() > today:
+                        unsettled += float(amt)
+        except Exception as e:
+            print(f"  [警告] 富邦未交割款抓取失敗,以 0 計:{e}")
+
+        return {"positions": positions, "settlement_cash": settlement_cash,
+                "unsettled": unsettled}
     finally:
         sdk.logout()
 
@@ -180,15 +237,33 @@ def fetch_fubon_futures(acc_cfg: dict):
         cash_balance = float(data.today_balance)
         unrealized_pnl = float(data.fut_unrealized_pnl) + float(data.opt_pnl)
         equity = float(data.today_equity)
-        # 淨口數(多單口數 − 空單口數)。單一商品帳戶用這個即可;若同時持有
-        # 多種期貨商品才需要另查未平倉明細分商品。
-        net_lots = float(getattr(data, "buy_lot", 0) or 0) - \
-            float(getattr(data, "sell_lot", 0) or 0)
+
+        # 未平倉口數與實質價值:一定要用 query_single_position(),
+        # 不能用 margin_equity 的 buy_lot/sell_lot——那是「當日成交口數」,
+        # 沒交易的日子會是 0,會誤判成空手(實測 08/07 兩口在手但都是 0)。
+        # 每筆部位自帶 market_price = 期貨即時報價,直接拿它算實質價值,
+        # 不必用現股收盤價替代,沒有基差誤差。
+        multiplier = float(acc_cfg.get("multiplier", 0) or 0)
+        net_lots = 0.0
+        notional = 0.0
+        pos_result = sdk.futopt_accounting.query_single_position(futures_acc)
+        if not pos_result.is_success:
+            raise RuntimeError(f"富邦期貨未平倉查詢失敗: {pos_result.message}")
+        for p in pos_result.data or []:
+            lots = float(getattr(p, "orig_lots", 0) or 0)
+            if str(getattr(p, "buy_sell", "")).lower().endswith("sell"):
+                lots = -lots
+            net_lots += lots
+            mkt = getattr(p, "market_price", None)
+            if mkt:
+                notional += float(mkt) * multiplier * lots
+
         return {
             "cash_balance": cash_balance,
             "unrealized_pnl": unrealized_pnl,
             "equity": equity,
             "net_lots": net_lots,
+            "notional": notional,
         }
     finally:
         sdk.logout()

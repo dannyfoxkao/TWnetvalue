@@ -8,9 +8,11 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS totals (
     date TEXT PRIMARY KEY,          -- 交易日 YYYY-MM-DD
     market_value REAL NOT NULL,     -- 各帳戶證券市值合計
-    cash REAL NOT NULL,
+    cash REAL NOT NULL,             -- 交割戶餘額 + 手動現金 + 期貨閒置
     debt REAL NOT NULL,
-    net_value REAL NOT NULL         -- market_value + cash - debt
+    net_value REAL NOT NULL,        -- market_value + cash + unsettled - debt
+    unsettled REAL,                 -- 未交割款淨額(T+2 制度修正,應收正/應付負)
+    broker_cash REAL                -- 其中來自券商交割戶的部分(自動抓,供重算用)
 );
 CREATE TABLE IF NOT EXISTS account_snapshots (
     date TEXT NOT NULL,
@@ -57,6 +59,10 @@ def connect() -> sqlite3.Connection:
 
 def _migrate(conn):
     """對既有資料庫補上後來才加的欄位(CREATE TABLE IF NOT EXISTS 不會改舊表)。"""
+    tot_cols = {row[1] for row in conn.execute("PRAGMA table_info(totals)")}
+    for col in ("unsettled", "broker_cash"):
+        if col not in tot_cols:
+            conn.execute(f"ALTER TABLE totals ADD COLUMN {col} REAL")
     pos_cols = {row[1] for row in conn.execute("PRAGMA table_info(positions)")}
     if "name" not in pos_cols:
         conn.execute("ALTER TABLE positions ADD COLUMN name TEXT")
@@ -68,18 +74,23 @@ def _migrate(conn):
 
 
 def save_snapshot(conn, date, market_value, account_values, positions, cash, debt,
-                  bench_closes):
+                  bench_closes, unsettled=0.0, broker_cash=0.0):
     """寫入一天的快照。同一天重跑會覆蓋(以最後一次為準)。
 
-    market_value 由呼叫端算好傳入(證券市值 + 期貨部位佔用保證金),不再由
+    market_value 由呼叫端算好傳入(證券市值 + 期貨部位實質價值),不再由
     account_values 直接加總——因為期貨的閒置保證金已改歸類到 cash。
     account_values 仍保留各帳戶總值,供「各帳戶市值」圖使用。
+
+    unsettled 是未交割款淨額(T+2 制度):賣出後錢還沒進來(正數)、
+    買進後錢還沒扣(負數),不加這項的話交易後兩天淨值會失真。
     """
-    net_value = market_value + cash - debt
+    net_value = market_value + cash + unsettled - debt
     with conn:
         conn.execute(
-            "INSERT OR REPLACE INTO totals VALUES (?,?,?,?,?)",
-            (date, market_value, cash, debt, net_value),
+            "INSERT OR REPLACE INTO totals"
+            " (date, market_value, cash, debt, net_value, unsettled, broker_cash)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (date, market_value, cash, debt, net_value, unsettled, broker_cash),
         )
         conn.execute("DELETE FROM account_snapshots WHERE date=?", (date,))
         conn.executemany(
