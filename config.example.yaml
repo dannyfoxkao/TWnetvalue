@@ -36,18 +36,35 @@ accounts:
   #   所以用的是期貨自己的價格,沒有拿現股價替代的基差問題。
   #   帳戶權益數扣掉實質價值後的餘額歸類為現金;槓桿部位這個餘額
   #   會是負的,那是正確的(代表曝險大於自有資金)。
-  # multiplier 是每口的契約乘數,下例為小型台灣50期貨(每口 1000 單位)。
+  #
+  # 契約乘數要「逐商品」設定,不同期貨規格差很多:
+  #   小型台灣50 ETF 期貨(FISRF)= 每口 1000 單位
+  #   小型個股期貨(如小台達電 FIRVF)= 每口 100 股
+  # 全部套同一個乘數會把個股期貨的部位價值放大 10 倍。
+  # key 用 query_single_position() 回傳的 symbol(不含月份);沒列到的商品
+  # 會用 default_multiplier 並在執行時印警告,提醒你補設定。
   fubon_futures:
     type: fubon_futures
     enabled: false
-    multiplier: 1000
+    multipliers:
+      FISRF: 1000
+      FIRVF: 100
+    default_multiplier: 100
 
   # 手動持股表(沒有券商 API 時用這個)
-  # 只需要維護代號和股數,收盤價每天自動抓。
+  # 只需要維護代號和股數,收盤價每天自動抓。cost 欄位選填(均價成本)。
   manual:
     type: manual
     enabled: true
     positions_file: positions_manual.csv
+
+  # 海外持股(複委託):富邦 Neo API 查不到複委託庫存,只能手動維護股數。
+  # ticker 用 Yahoo Finance 代號(日股加 .T,美股直接寫),
+  # 價格與匯率由 yfinance 自動抓並換算台幣。
+  fubon_foreign:
+    type: manual_foreign
+    enabled: false
+    positions_file: positions_foreign.csv
 
 # ---------- 現金 ----------
 # 注意:券商交割戶餘額由 API 自動抓(永豐 account_balance、富邦 bank_remain),

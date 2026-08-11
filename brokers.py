@@ -18,21 +18,98 @@ import os
 from pathlib import Path
 
 
+def _read_csv_rows(path):
+    """讀持股 CSV,對編碼容錯。
+
+    這些檔案常被 Excel / 記事本開過再存,中文註解容易變成 Big5 或半毀的
+    UTF-8。代號和股數欄位都是 ASCII,所以就算註解解不開也不該讓整份快照
+    掛掉——依序嘗試常見編碼,最後退回 errors="replace" 硬讀。
+    """
+    for enc in ("utf-8-sig", "cp950", "big5"):
+        try:
+            with open(path, newline="", encoding=enc) as f:
+                return list(csv.DictReader(f)), None
+        except UnicodeDecodeError:
+            continue
+    with open(path, newline="", encoding="utf-8", errors="replace") as f:
+        return list(csv.DictReader(f)), (
+            f"{Path(path).name} 編碼已損毀,已略過無法解讀的字元(代號與股數不受影響)。"
+            " 建議用 UTF-8 重存這個檔案。")
+
+
 def fetch_manual(acc_cfg: dict):
     """手動持股表:只維護代號+股數,價格交給 FinMind。"""
     path = Path(__file__).parent / acc_cfg["positions_file"]
     positions = []
-    with open(path, newline="", encoding="utf-8-sig") as f:
-        for row in csv.DictReader(f):
-            code = row["code"].strip()
-            if not code:
-                continue
-            positions.append({
-                "code": code,
-                "shares": float(row["shares"]),
-                "price": None,
-                "market_value": None,
-            })
+    rows, warn = _read_csv_rows(path)
+    if warn:
+        print(f"  [警告] {warn}")
+    for row in rows:
+        code = (row.get("code") or "").strip()
+        if not code or code.startswith("#"):
+            continue
+        cost = (row.get("cost") or "").strip()   # 選填:均價成本
+        positions.append({
+            "code": code,
+            "shares": float(row["shares"]),
+            "price": None,
+            "market_value": None,
+            "cost_price": float(cost) if cost else None,
+        })
+    return {"positions": positions, "settlement_cash": 0.0, "unsettled": 0.0}
+
+
+def fetch_manual_foreign(acc_cfg: dict):
+    """海外持股(複委託)手動表:富邦 Neo API 查不到複委託庫存,只能自己維護。
+
+    CSV 欄位:ticker, shares, note
+      ticker 用 Yahoo Finance 代號(日股加 .T,如 7203.T 豐田;美股直接寫 AAPL)
+    價格與匯率都用 yfinance 自動抓,換算成台幣計價,所以只要維護股數。
+    """
+    import yfinance as yf  # 延遲載入
+
+    path = Path(__file__).parent / acc_cfg["positions_file"]
+    raw_rows, warn = _read_csv_rows(path)
+    if warn:
+        print(f"  [警告] {warn}")
+    rows = []
+    for row in raw_rows:
+        ticker = (row.get("ticker") or "").strip()
+        if not ticker or ticker.startswith("#"):
+            continue
+        rows.append((ticker, float(row["shares"])))
+    if not rows:
+        return {"positions": [], "settlement_cash": 0.0, "unsettled": 0.0}
+
+    fx_cache = {}
+
+    def to_twd(amount, currency):
+        """外幣換台幣。TWD 直接回傳,其他幣別抓 <CUR>TWD=X 匯率。"""
+        if currency in (None, "", "TWD"):
+            return amount
+        if currency not in fx_cache:
+            hist = yf.Ticker(f"{currency}TWD=X").history(period="5d")
+            if hist.empty:
+                raise RuntimeError(f"抓不到 {currency}/TWD 匯率")
+            fx_cache[currency] = float(hist["Close"].iloc[-1])
+        return amount * fx_cache[currency]
+
+    positions = []
+    for ticker, shares in rows:
+        tk = yf.Ticker(ticker)
+        hist = tk.history(period="5d")
+        if hist.empty:
+            raise RuntimeError(f"海外持股 {ticker} 抓不到價格,中止(避免市值少算)")
+        price_local = float(hist["Close"].iloc[-1])
+        currency = (tk.fast_info.get("currency") if hasattr(tk, "fast_info") else None) or "USD"
+        price_twd = to_twd(price_local, currency)
+        positions.append({
+            "code": ticker,
+            "shares": shares,
+            "price": price_twd,                 # 已換算台幣,與台股同單位
+            "market_value": price_twd * shares,
+            "name": f"{ticker}({currency} {price_local:,.2f})",
+        })
     return {"positions": positions, "settlement_cash": 0.0, "unsettled": 0.0}
 
 
@@ -75,6 +152,8 @@ def fetch_shioaji(acc_cfg: dict):
                 "shares": shares,
                 "price": last,
                 "market_value": last * shares if last else None,
+                # StockPosition.price 是「均價成本」,不是現價(現價在 last_price)
+                "cost_price": float(p.price) if p.price else None,
             })
 
         # 交割戶餘額(自動抓,不用手動維護)
@@ -141,6 +220,19 @@ def fetch_fubon(acc_cfg: dict):
         result = sdk.accounting.inventories(account)
         if not result.is_success:
             raise RuntimeError(f"富邦庫存查詢失敗: {result.message}")
+        # 成本均價:inventories() 沒有成本欄位,要另外查未實現損益,
+        # 以 stock_no 對應回庫存。
+        cost_map = {}
+        try:
+            ur = sdk.accounting.unrealized_gains_and_loses(account)
+            if ur.is_success:
+                for u in ur.data or []:
+                    cp = getattr(u, "cost_price", None)
+                    if cp:
+                        cost_map[str(u.stock_no)] = float(cp)
+        except Exception as e:
+            print(f"  [警告] 富邦成本查詢失敗,成本欄位留空:{e}")
+
         positions = []
         for inv in result.data:
             # 整股(集保)股數在頂層;零股股數包在巢狀的 inv.odd 子物件裡,
@@ -154,6 +246,7 @@ def fetch_fubon(acc_cfg: dict):
                 "shares": shares,
                 "price": None,          # 用 FinMind 收盤價統一計價
                 "market_value": None,
+                "cost_price": cost_map.get(str(inv.stock_no)),
             })
 
         # 交割戶餘額(自動抓,不用手動維護)
@@ -243,7 +336,12 @@ def fetch_fubon_futures(acc_cfg: dict):
         # 沒交易的日子會是 0,會誤判成空手(實測 08/07 兩口在手但都是 0)。
         # 每筆部位自帶 market_price = 期貨即時報價,直接拿它算實質價值,
         # 不必用現股收盤價替代,沒有基差誤差。
-        multiplier = float(acc_cfg.get("multiplier", 0) or 0)
+        #
+        # 乘數必須「逐商品」查表:不同期貨契約規格不同
+        # (小型台灣50 ETF 期貨 1 口 = 1000 單位;小型個股期貨 1 口 = 100 股),
+        # 全部套同一個乘數會把個股期貨的部位價值放大 10 倍。
+        mult_map = acc_cfg.get("multipliers") or {}
+        default_mult = acc_cfg.get("default_multiplier")
         net_lots = 0.0
         notional = 0.0
         pos_result = sdk.futopt_accounting.query_single_position(futures_acc)
@@ -254,9 +352,21 @@ def fetch_fubon_futures(acc_cfg: dict):
             if str(getattr(p, "buy_sell", "")).lower().endswith("sell"):
                 lots = -lots
             net_lots += lots
+            symbol = str(getattr(p, "symbol", "") or "")
+            if symbol in mult_map:
+                mult = float(mult_map[symbol])
+            elif default_mult is not None:
+                mult = float(default_mult)
+                print(f"  [警告] 期貨商品 {symbol} 不在 multipliers 設定中,"
+                      f"暫用 default_multiplier={mult:g};請到 config.yaml 補上正確乘數")
+            else:
+                raise RuntimeError(
+                    f"期貨商品 {symbol} 沒有設定契約乘數。請在 config.yaml 的 "
+                    f"fubon_futures.multipliers 加上 {symbol},或設 default_multiplier。"
+                )
             mkt = getattr(p, "market_price", None)
             if mkt:
-                notional += float(mkt) * multiplier * lots
+                notional += float(mkt) * mult * lots
 
         return {
             "cash_balance": cash_balance,
@@ -271,6 +381,7 @@ def fetch_fubon_futures(acc_cfg: dict):
 
 ADAPTERS = {
     "manual": fetch_manual,
+    "manual_foreign": fetch_manual_foreign,
     "shioaji": fetch_shioaji,
     "fubon": fetch_fubon,
 }

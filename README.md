@@ -61,7 +61,8 @@ pip install -r requirements.txt
 | 檔案 | 用途 |
 |---|---|
 | `config.yaml` | 帳戶開關、現金、負債、基準指數 |
-| `positions_manual.csv` | 手動持股表 |
+| `positions_manual.csv` | 手動持股表(台股) |
+| `positions_foreign.csv` | 海外持股表(複委託,API 查不到只能手動) |
 | `snapshot.py` | 每日快照主程式(排程跑這支) |
 | `update_cash.py` | 只更新現金/負債,不重抓持股 |
 | `dashboard.py` | Streamlit 儀表板 |
@@ -128,6 +129,11 @@ pip install -r requirements.txt
    都自動抓,加減口不用手動改。
    槓桿部位的現金部分會是**負數**,那是正確的——代表曝險大於自有資金。
 
+> ⚠️ **契約乘數要逐商品設定**:小型台灣50 ETF 期貨(`FISRF`)每口 1000 單位,
+> 小型個股期貨(如小台達電 `FIRVF`)每口只有 100 股。全部套同一個乘數會把
+> 個股期貨的部位價值放大 10 倍。沒設定到的 symbol 會用 `default_multiplier`
+> 並印警告。
+>
 > ⚠️ **口數一定要用 `query_single_position()`,不能用 `query_margin_equity()`
 > 的 `buy_lot` / `sell_lot`**——後者是「**當日**成交口數」,沒交易的日子會是 0,
 > 會把在手部位誤判成空手(實測:帳上 2 口但兩個欄位都是 0,`initial_margin`
@@ -143,6 +149,37 @@ pip install -r requirements.txt
 >
 > 若你的 SDK 版本欄位對不上,跑 `debug_fubon_inv.py`、`debug_fubon_futures.py`
 > 或 `debug_settlements.py` 印出原始結構來對照。
+
+### 海外持股(複委託)
+
+**富邦 Neo API 查不到複委託庫存**——SDK 只有 `stock` 和 `futopt` 兩個模組,
+登入也只回傳這兩個帳戶。所以海外部位只能手動維護股數:
+
+1. 複製 `positions_foreign.example.csv` 成 `positions_foreign.csv`,填入
+   Yahoo Finance 代號與股數(日股加 `.T`,如 `7203.T`;美股直接寫 `AAPL`)
+2. `config.yaml` 把 `fubon_foreign.enabled` 改 `true`
+
+價格與匯率都由 yfinance 自動抓並換算成台幣,只需要維護股數。持股明細會在
+名稱欄顯示原幣價格(如 `7203.T(JPY 2,161.00)`)方便對帳。
+
+> CSV 檔容易被 Excel / 記事本存成 Big5 導致中文註解損毀。讀取器會依序嘗試
+> `utf-8-sig` → `cp950` → `big5`,再退回 `errors="replace"`,所以註解壞掉
+> 不會讓整份快照失敗(代號與股數是 ASCII 不受影響),但會印警告提醒你重存。
+
+---
+
+## 成本與損益
+
+持股明細會顯示**成本均價、成本市值、損益、報酬%**,資料來源:
+
+- **永豐**:`list_positions()` 的 `price` 欄位就是均價成本
+  (容易誤會——現價在 `last_price`)
+- **富邦**:`inventories()` 沒有成本欄位,要另外呼叫
+  `unrealized_gains_and_loses()` 拿 `cost_price`,以 `stock_no` 對回庫存
+- **手動表**:`cost` 欄位選填
+
+同一檔跨券商持有時,成本用**加權平均**合併(同一檔在不同券商的買進成本
+往往差很多)。任一邊缺成本就整檔留空顯示「—」,不會拿部分資料算出誤導的均價。
 
 ---
 

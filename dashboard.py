@@ -103,6 +103,34 @@ if _unsettled:
 _cap += f"|負債 {latest['debt']:,.0f}"
 st.caption(_cap)
 
+# ---------- 各帳戶現金明細 ----------
+_acc_latest = accounts[accounts["date"] == latest["date"]] if not accounts.empty else accounts
+if not _acc_latest.empty and "settlement_cash" in _acc_latest.columns:
+    _rows = []
+    for _, r in _acc_latest.iterrows():
+        sc = r.get("settlement_cash")
+        un = r.get("unsettled") or 0
+        if pd.isna(sc):
+            continue
+        _rows.append({"帳戶": r["account"], "現金": sc, "未交割款": un,
+                      "合計": sc + un})
+    if _rows:
+        _known = sum(x["合計"] for x in _rows)
+        _other = latest["cash"] + (latest.get("unsettled") or 0) - _known
+        if abs(_other) >= 1:      # config.yaml 手填的其他現金
+            _rows.append({"帳戶": "其他(config.yaml)", "現金": _other,
+                          "未交割款": 0, "合計": _other})
+        _rows.append({"帳戶": "合計", "現金": sum(x["現金"] for x in _rows),
+                      "未交割款": sum(x["未交割款"] for x in _rows),
+                      "合計": sum(x["合計"] for x in _rows)})
+        with st.expander("各帳戶現金明細", expanded=True):
+            st.dataframe(
+                pd.DataFrame(_rows).style.format(
+                    {"現金": "{:,.0f}", "未交割款": "{:+,.0f}", "合計": "{:,.0f}"}),
+                width="stretch", hide_index=True)
+            st.caption("期貨帳戶的「現金」為權益數扣掉部位實質價值後的閒置保證金;"
+                       "槓桿部位會是負數,代表曝險大於自有資金。")
+
 # ---------- 淨值曲線 ----------
 fig = go.Figure(layout=LAYOUT)
 fig.add_scatter(x=totals["date"], y=nv, mode="lines", name="淨值",
@@ -198,6 +226,7 @@ else:
     has_name = "name" in latest_pos.columns
     total_mv = latest_pos["market_value"].sum()
 
+    has_cost = "cost_price" in latest_pos.columns
     rows = []
     # 同一代號跨券商合併成一列,另存各券商股數拆解
     for code, grp in latest_pos.groupby("code"):
@@ -205,20 +234,47 @@ else:
         breakdown = " + ".join(
             f"{r['account']} {r['shares']:,.0f}" for _, r in grp.iterrows()
         )
-        rows.append({
+        shares = grp["shares"].sum()
+        mv = grp["market_value"].sum()
+        row = {
             "代號": code,
             "名稱": grp["name"].iloc[0] if has_name else "",
-            "總股數": grp["shares"].sum(),
-            "價格": grp["price"].iloc[0],
-            "市值": grp["market_value"].sum(),
-            "比重%": grp["market_value"].sum() / total_mv * 100,
+            "總股數": shares,
+        }
+        if has_cost:
+            # 跨券商成本用加權平均(同一檔在兩家的買進成本不同);
+            # 任一邊缺成本就整檔留空,避免算出誤導的均價
+            valid = grp[grp["cost_price"].notna()]
+            if len(valid) == len(grp) and shares:
+                total_cost = (valid["cost_price"] * valid["shares"]).sum()
+                row["成本均價"] = total_cost / shares
+                row["成本市值"] = total_cost
+                row["損益"] = mv - total_cost
+                row["報酬%"] = (mv / total_cost - 1) * 100 if total_cost else None
+            else:
+                row["成本均價"] = row["成本市值"] = row["損益"] = row["報酬%"] = None
+        row.update({
+            "現價": grp["price"].iloc[0],
+            "市值": mv,
+            "比重%": mv / total_mv * 100,
             "帳戶拆解": breakdown,
         })
+        rows.append(row)
 
     show = pd.DataFrame(rows).sort_values("市值", ascending=False)
     if not has_name:
         show = show.drop(columns=["名稱"])
-    st.dataframe(
-        show.style.format({"總股數": "{:,.0f}", "價格": "{:,.2f}",
-                           "市值": "{:,.0f}", "比重%": "{:.1f}"}),
-        width="stretch", hide_index=True)
+    fmt = {"總股數": "{:,.0f}", "現價": "{:,.2f}", "市值": "{:,.0f}",
+           "比重%": "{:.1f}"}
+    if has_cost:
+        fmt.update({"成本均價": "{:,.2f}", "成本市值": "{:,.0f}",
+                    "損益": "{:+,.0f}", "報酬%": "{:+.1f}"})
+    st.dataframe(show.style.format(fmt, na_rep="—"),
+                 width="stretch", hide_index=True)
+
+    if has_cost:
+        _v = show.dropna(subset=["成本市值"]) if "成本市值" in show.columns else show.iloc[0:0]
+        if not _v.empty:
+            _c, _m = _v["成本市值"].sum(), _v["市值"].sum()
+            st.caption(f"已知成本部位合計:成本 {_c:,.0f} → 市值 {_m:,.0f}"
+                       f",未實現損益 {_m - _c:+,.0f}({(_m/_c - 1)*100:+.2f}%)")

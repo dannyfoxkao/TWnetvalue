@@ -18,6 +18,8 @@ CREATE TABLE IF NOT EXISTS account_snapshots (
     date TEXT NOT NULL,
     account TEXT NOT NULL,
     market_value REAL NOT NULL,
+    settlement_cash REAL,           -- 該帳戶交割戶餘額(期貨帳戶放閒置保證金)
+    unsettled REAL,                 -- 該帳戶未交割款
     PRIMARY KEY (date, account)
 );
 CREATE TABLE IF NOT EXISTS positions (
@@ -28,6 +30,7 @@ CREATE TABLE IF NOT EXISTS positions (
     shares REAL NOT NULL,
     price REAL,
     market_value REAL,
+    cost_price REAL,                -- 均價成本(券商提供,手動表可選填)
     PRIMARY KEY (date, account, code)
 );
 CREATE TABLE IF NOT EXISTS benchmarks (
@@ -63,9 +66,15 @@ def _migrate(conn):
     for col in ("unsettled", "broker_cash"):
         if col not in tot_cols:
             conn.execute(f"ALTER TABLE totals ADD COLUMN {col} REAL")
+    acc_cols = {row[1] for row in conn.execute("PRAGMA table_info(account_snapshots)")}
+    for col in ("settlement_cash", "unsettled"):
+        if col not in acc_cols:
+            conn.execute(f"ALTER TABLE account_snapshots ADD COLUMN {col} REAL")
     pos_cols = {row[1] for row in conn.execute("PRAGMA table_info(positions)")}
     if "name" not in pos_cols:
         conn.execute("ALTER TABLE positions ADD COLUMN name TEXT")
+    if "cost_price" not in pos_cols:
+        conn.execute("ALTER TABLE positions ADD COLUMN cost_price REAL")
     fut_cols = {row[1] for row in conn.execute("PRAGMA table_info(futures_snapshots)")}
     for col in ("net_lots", "notional", "free_cash"):
         if col not in fut_cols:
@@ -74,7 +83,7 @@ def _migrate(conn):
 
 
 def save_snapshot(conn, date, market_value, account_values, positions, cash, debt,
-                  bench_closes, unsettled=0.0, broker_cash=0.0):
+                  bench_closes, unsettled=0.0, broker_cash=0.0, account_cash=None):
     """寫入一天的快照。同一天重跑會覆蓋(以最後一次為準)。
 
     market_value 由呼叫端算好傳入(證券市值 + 期貨部位實質價值),不再由
@@ -94,15 +103,21 @@ def save_snapshot(conn, date, market_value, account_values, positions, cash, deb
         )
         conn.execute("DELETE FROM account_snapshots WHERE date=?", (date,))
         conn.executemany(
-            "INSERT INTO account_snapshots VALUES (?,?,?)",
-            [(date, acc, mv) for acc, mv in account_values.items()],
+            "INSERT INTO account_snapshots"
+            " (date, account, market_value, settlement_cash, unsettled)"
+            " VALUES (?,?,?,?,?)",
+            [(date, acc, mv,
+              (account_cash or {}).get(acc, {}).get("settlement_cash"),
+              (account_cash or {}).get(acc, {}).get("unsettled"))
+             for acc, mv in account_values.items()],
         )
         conn.execute("DELETE FROM positions WHERE date=?", (date,))
         conn.executemany(
-            "INSERT INTO positions (date, account, code, name, shares, price, market_value)"
-            " VALUES (?,?,?,?,?,?,?)",
+            "INSERT INTO positions"
+            " (date, account, code, name, shares, price, market_value, cost_price)"
+            " VALUES (?,?,?,?,?,?,?,?)",
             [(date, p["account"], p["code"], p.get("name"), p["shares"],
-              p["price"], p["market_value"])
+              p["price"], p["market_value"], p.get("cost_price"))
              for p in positions],
         )
         conn.executemany(

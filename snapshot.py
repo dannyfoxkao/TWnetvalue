@@ -43,6 +43,7 @@ def main():
     futures_values = {}
     broker_cash = 0.0      # 各券商交割戶餘額(自動抓)
     unsettled = 0.0        # 未交割款淨額(T+2 修正)
+    account_cash = {}      # 逐帳戶現金明細,供儀表板分開列出
     for name, acc_cfg in cfg["accounts"].items():
         if not acc_cfg.get("enabled"):
             continue
@@ -76,6 +77,10 @@ def main():
         all_positions.extend(positions)
         broker_cash += res.get("settlement_cash", 0.0)
         unsettled += res.get("unsettled", 0.0)
+        account_cash[name] = {
+            "settlement_cash": res.get("settlement_cash", 0.0),
+            "unsettled": res.get("unsettled", 0.0),
+        }
         msg = f"帳戶 {name}: {len(positions)} 檔持股"
         if res.get("settlement_cash"):
             msg += f",交割戶 {res['settlement_cash']:,.0f}"
@@ -100,7 +105,9 @@ def main():
     if all_positions:
         name_map = prices.stock_names(token)
         for p in all_positions:
-            p["name"] = name_map.get(p["code"], "")
+            # adapter 已給名稱的(如海外持股)不覆蓋
+            if not p.get("name"):
+                p["name"] = name_map.get(p["code"], "")
 
     for name in {p["account"] for p in all_positions}:
         account_values[name] = sum(
@@ -115,8 +122,10 @@ def main():
     #    權益數扣掉實質價值後的餘額歸類為現金。
     #    注意:槓桿部位的實質價值可能大於權益數,此時 free_cash 為負,
     #    那是正確的——負現金代表你的曝險超過自有資金(借來的部位)。
-    for f in futures_values.values():
+    for acc_name, f in futures_values.items():
         f["free_cash"] = f["equity"] - f["notional"]
+        # 期貨帳戶的「現金」就是權益數扣掉部位後的閒置保證金
+        account_cash[acc_name] = {"settlement_cash": f["free_cash"], "unsettled": 0.0}
 
     # 5. 現金與負債
     #    現金 = 券商交割戶(自動) + config 手動現金 + 期貨(權益數 − 實質價值)
@@ -135,7 +144,7 @@ def main():
     prev = db.previous_total(conn, snap_date)
     net_value = db.save_snapshot(
         conn, snap_date, market_value, account_values, all_positions,
-        cash, debt, bench_closes, unsettled, broker_cash
+        cash, debt, bench_closes, unsettled, broker_cash, account_cash
     )
     if futures_values:
         db.save_futures_snapshot(conn, snap_date, futures_values)

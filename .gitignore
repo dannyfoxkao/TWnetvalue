@@ -9,8 +9,9 @@
 finmind_token.json
 # 內含交割戶餘額、負債金額(範本見 config.example.yaml)
 config.yaml
-# 實際持股(範本見 positions_manual.example.csv)
+# 實際持股(範本見 positions_*.example.csv)
 positions_manual.csv
+positions_foreign.csv
 # 完整持股與淨值歷史
 networth.db
 # 券商憑證檔
