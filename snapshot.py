@@ -4,12 +4,14 @@
     python snapshot.py            # 正常執行(建議收盤後跑)
 排程後每天自動執行,同一天重跑會覆蓋當天資料。
 """
+import math
 import sys
 from pathlib import Path
 
 import yaml
 from dotenv import load_dotenv
 
+import cfgutil
 import db
 import prices
 from brokers import ADAPTERS, fetch_fubon_futures
@@ -55,8 +57,6 @@ def main():
                 print(f"[錯誤] 帳戶 {name} 抓取失敗:{e}")
                 print("為避免淨值失真(少算一個帳戶),本次中止,不寫入資料。")
                 sys.exit(1)
-            fut["underlying"] = str(acc_cfg.get("underlying", ""))
-            fut["multiplier"] = float(acc_cfg.get("multiplier", 0) or 0)
             futures_values[name] = fut
             account_values[name] = fut["equity"]
             print(f"帳戶 {name}(期貨): 權益 {fut['equity']:,.0f}"
@@ -130,8 +130,21 @@ def main():
     # 5. 現金與負債
     #    現金 = 券商交割戶(自動) + config 手動現金 + 期貨(權益數 − 實質價值)
     #    另外加未交割款(T+2 修正),投資部位 = 證券市值 + 期貨實質價值
-    config_cash = sum(item["amount"] for item in cfg.get("cash", []) or [])
-    debt = sum(item["amount"] for item in cfg.get("debt", []) or [])
+    try:
+        config_cash = cfgutil.sum_amounts(cfg.get("cash"), "cash")
+        debt = cfgutil.sum_amounts(cfg.get("debt"), "debt")
+    except cfgutil.ConfigError as e:
+        print(f"[錯誤] {e}")
+        sys.exit(1)
+
+    # 防呆:NaN 不是 None,任何 is None 檢查都抓不到,放著會一路污染總市值,
+    # 最後在寫入資料庫時才以難懂的 NOT NULL 錯誤爆掉。在這裡就擋下並指名哪一檔。
+    bad = [p["code"] for p in all_positions
+           if p["market_value"] is None or not math.isfinite(p["market_value"])]
+    if bad:
+        print(f"[錯誤] 這些持股的市值無效(None/NaN):{', '.join(bad)}")
+        print("為避免寫入錯誤的淨值,本次中止。請檢查該檔的報價來源。")
+        sys.exit(1)
 
     stock_mv = sum(p["market_value"] for p in all_positions)
     futures_position = sum(f["notional"] for f in futures_values.values())

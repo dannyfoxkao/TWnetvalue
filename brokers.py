@@ -14,6 +14,7 @@ price/market_value 為 None 時,由 snapshot.py 用 FinMind 收盤價補上。
 """
 import csv
 import datetime as dt
+import math
 import os
 from pathlib import Path
 
@@ -83,24 +84,36 @@ def fetch_manual_foreign(acc_cfg: dict):
 
     fx_cache = {}
 
+    def _last_close(tk_symbol, label):
+        """取最後一筆有效收盤價。
+
+        yfinance 對「當日進行中」或休市日常回傳 NaN 收盤價,直接取 iloc[-1]
+        會拿到 NaN,一路污染總市值(NaN 不是 None,任何 is None 檢查都抓不到,
+        最後在寫入資料庫時才以難懂的 NOT NULL 錯誤爆掉)。先 dropna 再取。
+        """
+        hist = yf.Ticker(tk_symbol).history(period="10d")
+        if hist.empty or "Close" not in hist:
+            raise RuntimeError(f"{label} 抓不到報價({tk_symbol})")
+        closes = hist["Close"].dropna()
+        if closes.empty:
+            raise RuntimeError(f"{label} 近十日收盤價全為空值({tk_symbol})")
+        val = float(closes.iloc[-1])
+        if not math.isfinite(val) or val <= 0:
+            raise RuntimeError(f"{label} 取得的價格不合理:{val}({tk_symbol})")
+        return val
+
     def to_twd(amount, currency):
         """外幣換台幣。TWD 直接回傳,其他幣別抓 <CUR>TWD=X 匯率。"""
         if currency in (None, "", "TWD"):
             return amount
         if currency not in fx_cache:
-            hist = yf.Ticker(f"{currency}TWD=X").history(period="5d")
-            if hist.empty:
-                raise RuntimeError(f"抓不到 {currency}/TWD 匯率")
-            fx_cache[currency] = float(hist["Close"].iloc[-1])
+            fx_cache[currency] = _last_close(f"{currency}TWD=X", f"{currency}/TWD 匯率")
         return amount * fx_cache[currency]
 
     positions = []
     for ticker, shares in rows:
         tk = yf.Ticker(ticker)
-        hist = tk.history(period="5d")
-        if hist.empty:
-            raise RuntimeError(f"海外持股 {ticker} 抓不到價格,中止(避免市值少算)")
-        price_local = float(hist["Close"].iloc[-1])
+        price_local = _last_close(ticker, f"海外持股 {ticker}")
         currency = (tk.fast_info.get("currency") if hasattr(tk, "fast_info") else None) or "USD"
         price_twd = to_twd(price_local, currency)
         positions.append({
@@ -258,9 +271,14 @@ def fetch_fubon(acc_cfg: dict):
         except Exception as e:
             print(f"  [警告] 富邦交割戶餘額抓取失敗,以 0 計:{e}")
 
-        # 未交割款:只算交割日尚未到的(已交割的餘額已反映,算了會重複)。
+        # 未交割款:取交割日「今天(含)以後」還掛在券商帳上的金額。
         # total_settlement_amount 負數=應付(買)、正數=應收(賣);
         # 沒成交的日期整筆欄位都是 None,要略過。
+        #
+        # 注意條件是 >= today 而不是 > today:交割當天的扣款約上午才會跑,
+        # 在那之前錢還在交割戶、應付款也還掛著,兩邊都要算。若寫成 > today,
+        # 交割日凌晨到扣款前這段會把應付款憑空抹掉,淨值被高估一整筆
+        # (實測:南亞 08/12 買進、08/14 交割,當天凌晨查詢該筆仍在清單上)。
         unsettled = 0.0
         try:
             st = sdk.accounting.query_settlement(account, "3d")
@@ -271,7 +289,7 @@ def fetch_fubon(acc_cfg: dict):
                     amt = getattr(d, "total_settlement_amount", None)
                     if not sd or amt is None:
                         continue
-                    if dt.datetime.strptime(sd, "%Y/%m/%d").date() > today:
+                    if dt.datetime.strptime(sd, "%Y/%m/%d").date() >= today:
                         unsettled += float(amt)
         except Exception as e:
             print(f"  [警告] 富邦未交割款抓取失敗,以 0 計:{e}")

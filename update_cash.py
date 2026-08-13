@@ -14,6 +14,8 @@ from pathlib import Path
 
 import yaml
 
+import cfgutil
+
 ROOT = Path(__file__).parent
 DB_PATH = ROOT / "networth.db"
 
@@ -21,8 +23,8 @@ DB_PATH = ROOT / "networth.db"
 def load_cash_debt():
     with open(ROOT / "config.yaml", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
-    cash = sum(item["amount"] for item in cfg.get("cash", []) or [])
-    debt = sum(item["amount"] for item in cfg.get("debt", []) or [])
+    cash = cfgutil.sum_amounts(cfg.get("cash"), "cash")
+    debt = cfgutil.sum_amounts(cfg.get("debt"), "debt")
     return cash, debt
 
 
@@ -62,7 +64,11 @@ def update_one(conn, date, config_cash, debt):
 
 
 def main():
-    cash, debt = load_cash_debt()
+    try:
+        cash, debt = load_cash_debt()
+    except cfgutil.ConfigError as e:
+        print(f"[錯誤] {e}")
+        sys.exit(1)
     conn = sqlite3.connect(DB_PATH)
 
     args = sys.argv[1:]

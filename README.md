@@ -65,6 +65,7 @@ pip install -r requirements.txt
 | `positions_foreign.csv` | 海外持股表(複委託,API 查不到只能手動) |
 | `snapshot.py` | 每日快照主程式(排程跑這支) |
 | `update_cash.py` | 只更新現金/負債,不重抓持股 |
+| `cfgutil.py` | config 金額驗證(YAML 不會做運算,金額必須是純數字) |
 | `dashboard.py` | Streamlit 儀表板 |
 | `brokers.py` | 券商 adapter(manual / shioaji / fubon / fubon_futures) |
 | `networth.db` | SQLite 資料(自動建立) |
@@ -193,11 +194,27 @@ pip install -r requirements.txt
 - 富邦:`sdk.accounting.bank_remain()` → `data.balance`
 
 **2. 未交割款自動計入**
-- 永豐:`api.settlements()` 回傳 T+0/1/2 三筆,**只取 T>0**
-  (T+0 當天已完成交割,餘額已反映,再加會重複)
 - 富邦:`query_settlement(account, "3d")`,取 `details` 裡
-  **`settlement_date` 還沒到**的 `total_settlement_amount`
+  **`settlement_date >= 今天**` 的 `total_settlement_amount`
   (負數=應付/買進、正數=應收/賣出;沒成交的日期欄位全是 `None`,要略過)
+- 永豐:`api.settlements()` 回傳 T+0/1/2 三筆,目前**只取 T>0**
+
+> ⚠️ **條件是 `>=` 今天,不是 `>`**。台股交割扣款約在交割日**上午**才跑,
+> 在那之前錢還在交割戶、應付款也還掛在券商帳上,**兩邊都要算**。
+> 寫成 `>` 的話,交割日凌晨到扣款前這段會把應付款憑空抹掉,淨值高估一整筆。
+> (實測:南亞 08/12 買進、08/14 交割,當天凌晨查詢該筆仍在清單上,
+> 而交割戶還沒被扣款。)
+>
+> 未驗證的假設:扣款完成後券商會把該筆從交割清單移除。若不會移除,
+> 扣款後到當天結束這段會反過來重複計算。永豐的 `T > 0` 也有同樣疑慮,
+> 但沒有實際未交割部位可驗證,暫時維持原樣。
+
+**3. 借錢買股票的記帳時序**(不然同一筆錢會被算兩次)
+- **買進當天**:應付款已記在「未交割款」,`config.yaml` 的 `debt` **先不要加**
+- **借款撥入交割戶時**:現金增加,這時 `debt` 才要加上借款
+- **交割日扣款後**:未交割款歸零、交割戶被扣,`debt` 維持
+
+判斷原則:`debt` 填的是**當下實際欠款**,錢還沒撥下來就還不是負債。
 
 淨值公式因此是 `投資部位 + 現金 + 未交割款 − 負債`。買進當天就認列應付、
 賣出當天就認列應收,兩天的失真窗口消失。
