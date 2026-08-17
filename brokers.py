@@ -271,14 +271,18 @@ def fetch_fubon(acc_cfg: dict):
         except Exception as e:
             print(f"  [警告] 富邦交割戶餘額抓取失敗,以 0 計:{e}")
 
-        # 未交割款:取交割日「今天(含)以後」還掛在券商帳上的金額。
+        # 未交割款:只取交割日「晚於今天」的,也就是還沒扣款的部分。
         # total_settlement_amount 負數=應付(買)、正數=應收(賣);
         # 沒成交的日期整筆欄位都是 None,要略過。
         #
-        # 注意條件是 >= today 而不是 > today:交割當天的扣款約上午才會跑,
-        # 在那之前錢還在交割戶、應付款也還掛著,兩邊都要算。若寫成 > today,
-        # 交割日凌晨到扣款前這段會把應付款憑空抹掉,淨值被高估一整筆
-        # (實測:南亞 08/12 買進、08/14 交割,當天凌晨查詢該筆仍在清單上)。
+        # 為什麼是 > today 而不是 >= today:券商在扣款後**不會**把該筆移出
+        # 清單,它是「哪天成交、哪天交割」的歷史紀錄,會留在三天查詢視窗內。
+        # 實測同一筆(08/12 買進、08/14 交割):
+        #   當天 00:47 交割戶 210,146、清單有該筆  → 錢還沒扣,應該算
+        #   當天 22:46 交割戶   9,126、清單仍有該筆 → 錢已扣,不該再算
+        # 因為清單本身分辨不出扣款與否,只能靠「交割日是否已過」判斷,
+        # 而這個判斷成立的前提是**快照在扣款完成後才跑**(見 snapshot.py
+        # 的執行時間檢查)。台股交割扣款約在交割日上午完成。
         unsettled = 0.0
         try:
             st = sdk.accounting.query_settlement(account, "3d")
@@ -289,7 +293,7 @@ def fetch_fubon(acc_cfg: dict):
                     amt = getattr(d, "total_settlement_amount", None)
                     if not sd or amt is None:
                         continue
-                    if dt.datetime.strptime(sd, "%Y/%m/%d").date() >= today:
+                    if dt.datetime.strptime(sd, "%Y/%m/%d").date() > today:
                         unsettled += float(amt)
         except Exception as e:
             print(f"  [警告] 富邦未交割款抓取失敗,以 0 計:{e}")

@@ -5,6 +5,7 @@ from pathlib import Path
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import yaml
 
 DB_PATH = Path(__file__).parent / "networth.db"
 
@@ -30,7 +31,24 @@ LAYOUT = dict(
     legend=dict(orientation="h", yanchor="top", y=-0.18, x=0),
 )
 
-BENCH_NAMES = {"TAIEX": "加權指數", "0050": "0050"}
+ROOT = Path(__file__).parent
+
+
+@st.cache_data(ttl=300)
+def load_cfg():
+    """讀 config.yaml 取指數名稱與要顯示的大盤卡片(避免在程式裡寫死)。"""
+    try:
+        with open(ROOT / "config.yaml", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+    except OSError:
+        cfg = {}
+    names = {str(b["id"]): b.get("name", str(b["id"]))
+             for b in cfg.get("benchmarks") or []}
+    cards = [str(x) for x in (cfg.get("market_cards") or [])]
+    return names, cards
+
+
+BENCH_NAMES, MARKET_CARDS = load_cfg()
 
 st.set_page_config(page_title="台股淨值追蹤", layout="wide")
 
@@ -60,6 +78,28 @@ if totals.empty:
 
 st.title("台股淨值追蹤")
 
+# ---------- 大盤指標卡 ----------
+# 用未經期間篩選的 bench 算漲跌,否則切到短期間時期初那天會找不到前一日收盤。
+if MARKET_CARDS and not bench.empty:
+    _cards = []
+    for bid in MARKET_CARDS:
+        grp = bench[bench["bench_id"] == bid].sort_values("date")
+        if grp.empty:
+            continue
+        close = grp["close"].iloc[-1]
+        prev = grp["close"].iloc[-2] if len(grp) > 1 else None
+        chg = (close - prev) if prev is not None else None
+        pct = (chg / prev * 100) if prev else None
+        _cards.append((BENCH_NAMES.get(bid, bid), grp["date"].iloc[-1], close, chg, pct))
+    if _cards:
+        cols = st.columns(len(_cards))
+        for col, (nm, dte, close, chg, pct) in zip(cols, _cards):
+            col.metric(
+                nm, f"{close:,.2f}",
+                (f"{chg:+,.2f} ({pct:+.2f}%)" if chg is not None else "—"),
+            )
+        st.caption(f"大盤收盤:{_cards[0][1]}(與前一交易日比較)")
+
 # ---------- 期間篩選 ----------
 period = st.radio("期間", ["全部", "1年", "6個月", "3個月", "1個月"],
                   horizontal=True, label_visibility="collapsed")
@@ -86,15 +126,26 @@ leverage = latest["debt"] / latest["net_value"] * 100 if latest["net_value"] els
 # 現金佔總資產比例 = 現金 / 總資產(總資產 = 淨值 + 負債 = 投資部位 + 現金)
 gross_assets = latest["net_value"] + latest["debt"]
 cash_pct = latest["cash"] / gross_assets * 100 if gross_assets else 0.0
+# 曝險倍數 = 投資部位 / 淨值。
+# 負債比只看得到「借了多少錢」,看不到期貨用保證金撐起來的部位——
+# 期貨實質價值整筆算在投資部位裡,但背後只壓了保證金。這個倍數才是
+# 「市場跌 1%,我的淨值跌幾 %」的答案。
+exposure = latest["market_value"] / latest["net_value"] if latest["net_value"] else 0.0
 
-c1, c2, c3, c4, c5, c6 = st.columns(6)
+c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
 c1.metric("淨值", f"{latest['net_value']:,.0f}",
           f"{day_chg:+,.0f} ({day_pct:+.2f}%)")
 c2.metric(f"累積報酬({period})", f"{total_ret:+.2f}%")
 c3.metric("最大回撤", f"{drawdown.min():.2f}%")
 c4.metric("目前回撤", f"{drawdown.iloc[-1]:.2f}%")
 c5.metric("現金比重", f"{cash_pct:.1f}%")
-c6.metric("槓桿比(負債/淨值)", f"{leverage:.1f}%")
+c6.metric("槓桿比(負債/淨值)", f"{leverage:.1f}%",
+          help="借款相對自有資金的比例。只反映借貸,不含期貨保證金槓桿。")
+c7.metric("曝險倍數", f"{exposure:.2f}x",
+          f"市場動 10% → 淨值動 {abs(exposure)*10:.1f}%",
+          delta_color="off",
+          help="投資部位 ÷ 淨值。含期貨實質價值,是真正的市場曝險放大倍數。"
+               "1.0x = 無槓桿;2.0x = 市場跌 10% 你的淨值跌 20%。")
 _unsettled = latest.get("unsettled") or 0
 _cap = (f"最後更新:{latest['date']}|投資部位 {latest['market_value']:,.0f}"
         f"|現金 {latest['cash']:,.0f}")
@@ -166,6 +217,29 @@ with right:
     fig.update_layout(title="回撤(%)", showlegend=False)
     st.plotly_chart(fig, width="stretch")
 
+# ---------- 槓桿走勢(曝險倍數 vs 負債比) ----------
+_lev_left, _lev_right = st.columns(2)
+with _lev_left:
+    _exp = totals["market_value"] / nv.replace(0, pd.NA)
+    fig = go.Figure(layout=LAYOUT)
+    fig.add_scatter(x=totals["date"], y=_exp, mode="lines", name="曝險倍數",
+                    line=dict(color=C_PNL, width=2),
+                    hovertemplate="%{y:.2f}x<extra></extra>")
+    # 1.0x = 無槓桿的參考線
+    fig.add_hline(y=1.0, line=dict(color=INK_MUTED, width=1, dash="dot"),
+                  annotation_text="1.0x 無槓桿", annotation_position="bottom right")
+    fig.update_layout(title="曝險倍數(投資部位 ÷ 淨值)", showlegend=False)
+    st.plotly_chart(fig, width="stretch")
+
+with _lev_right:
+    _debt_pct = totals["debt"] / nv.replace(0, pd.NA) * 100
+    fig = go.Figure(layout=LAYOUT)
+    fig.add_scatter(x=totals["date"], y=_debt_pct, mode="lines", name="負債比",
+                    line=dict(color=C_DRAWDOWN, width=2),
+                    hovertemplate="%{y:.1f}%<extra></extra>")
+    fig.update_layout(title="負債比(負債 ÷ 淨值)", showlegend=False)
+    st.plotly_chart(fig, width="stretch")
+
 # ---------- 帳戶市值 ----------
 if accounts["account"].nunique() > 1:
     fig = go.Figure(layout=LAYOUT)
@@ -190,7 +264,7 @@ if not futures.empty:
         if has_split:
             lots = latest_f.get("net_lots")
             lots_txt = f"{lots:+.0f} 口" if pd.notna(lots) else ""
-            fc2.metric("實質價值(那一口)", f"{latest_f['notional']:,.0f}", lots_txt)
+            fc2.metric("部位實質價值", f"{latest_f['notional']:,.0f}", lots_txt)
             fc3.metric("現金部分", f"{latest_f['free_cash']:,.0f}")
         else:
             fc2.metric("保證金餘額", f"{latest_f['cash_balance']:,.0f}")
@@ -199,14 +273,14 @@ if not futures.empty:
 
         fig = go.Figure(layout=LAYOUT)
         if has_split:
-            fig.add_bar(x=grp["date"], y=grp["notional"], name="實質價值(那一口)",
+            fig.add_bar(x=grp["date"], y=grp["notional"], name="部位實質價值",
                         marker_color=C_MARGIN,
                         hovertemplate="%{y:,.0f}<extra>實質價值</extra>")
             fig.add_bar(x=grp["date"], y=grp["free_cash"], name="現金部分",
                         marker_color=C_PNL,
                         hovertemplate="%{y:,.0f}<extra>現金部分</extra>")
             fig.update_layout(
-                title=f"{acc}:實質價值 + 現金部分 = 權益數", barmode="relative")
+                title=f"{acc}:部位實質價值 + 現金部分 = 權益數", barmode="relative")
         else:
             fig.add_bar(x=grp["date"], y=grp["cash_balance"], name="保證金餘額",
                         marker_color=C_MARGIN,

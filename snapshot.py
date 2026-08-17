@@ -4,6 +4,7 @@
     python snapshot.py            # 正常執行(建議收盤後跑)
 排程後每天自動執行,同一天重跑會覆蓋當天資料。
 """
+import datetime as dt
 import math
 import sys
 from pathlib import Path
@@ -24,7 +25,29 @@ def load_config():
         return yaml.safe_load(f)
 
 
+SETTLED_HOUR = 14      # 交割扣款完成的保守時點(台股約上午完成)
+
+
+def check_run_time(force: bool):
+    """平日太早跑會抓到「帳務還沒結算完」的中間狀態,先擋下來。
+
+    交割日的扣款約在上午完成,而券商的交割清單在扣款後仍會保留該筆
+    (分辨不出扣款與否),所以未交割款只能靠「交割日是否已過」判斷。
+    這個判斷在扣款前是錯的:錢還在交割戶、應付款也還在,會少算一筆義務。
+    收盤後再跑就沒有這個問題,排程設在 16:32 本來就安全。
+    """
+    now = dt.datetime.now()
+    if force or now.weekday() >= 5 or now.hour >= SETTLED_HOUR:
+        return
+    print(f"[中止] 現在是 {now:%H:%M},交割扣款可能還沒完成。")
+    print(f"  這時候跑會抓到中間狀態:錢還在交割戶、應付款卻已被視為交割完成,")
+    print(f"  淨值會失真。請在 {SETTLED_HOUR}:00 之後再跑(排程 16:32 不受影響)。")
+    print(f"  確定要跑請加 --force。")
+    sys.exit(1)
+
+
 def main():
+    check_run_time("--force" in sys.argv)
     load_dotenv(ROOT / ".env")
     cfg = load_config()
     token = prices.load_token(cfg["finmind_token_file"])
