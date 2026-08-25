@@ -63,9 +63,17 @@ def fetch_manual(acc_cfg: dict):
 def fetch_manual_foreign(acc_cfg: dict):
     """海外持股(複委託)手動表:富邦 Neo API 查不到複委託庫存,只能自己維護。
 
-    CSV 欄位:ticker, shares, note
-      ticker 用 Yahoo Finance 代號(日股加 .T,如 7203.T 豐田;美股直接寫 AAPL)
-    價格與匯率都用 yfinance 自動抓,換算成台幣計價,所以只要維護股數。
+    CSV 欄位:ticker, shares, cost, cost_date, note
+      ticker    Yahoo Finance 代號(日股加 .T,如 7203.T 豐田;美股直接寫 AAPL)
+      cost      選填,填「原幣」的每股成本(日股就填日圓價)
+      cost_date 選填,買進日期 YYYY-MM-DD;填了就用**那天**的匯率把成本換成
+                台幣,得到真正的台幣成本(含買進後的匯率變動);留空則用當前匯率。
+
+    **同一檔可以分多列**代表分批建倉,各批用自己的日期換匯後加權平均,
+    最後合併成一筆部位。任一批沒填成本,整檔的成本就留空(不拿半套資料
+    算出誤導的均價)。
+
+    現價與匯率都由 yfinance 自動抓並換算台幣,所以平時只要維護股數。
     """
     import yfinance as yf  # 延遲載入
 
@@ -73,13 +81,20 @@ def fetch_manual_foreign(acc_cfg: dict):
     raw_rows, warn = _read_csv_rows(path)
     if warn:
         print(f"  [警告] {warn}")
-    rows = []
+    lots = []
     for row in raw_rows:
         ticker = (row.get("ticker") or "").strip()
         if not ticker or ticker.startswith("#"):
             continue
-        rows.append((ticker, float(row["shares"])))
-    if not rows:
+        cost = (row.get("cost") or "").strip()
+        cdate = (row.get("cost_date") or "").strip()
+        lots.append({
+            "ticker": ticker,
+            "shares": float(row["shares"]),
+            "cost": float(cost) if cost else None,
+            "cost_date": cdate or None,
+        })
+    if not lots:
         return {"positions": [], "settlement_cash": 0.0, "unsettled": 0.0}
 
     fx_cache = {}
@@ -102,25 +117,59 @@ def fetch_manual_foreign(acc_cfg: dict):
             raise RuntimeError(f"{label} 取得的價格不合理:{val}({tk_symbol})")
         return val
 
-    def to_twd(amount, currency):
-        """外幣換台幣。TWD 直接回傳,其他幣別抓 <CUR>TWD=X 匯率。"""
+    def fx_rate(currency, on_date=None):
+        """取 <CUR>/TWD 匯率。on_date 為 None 時用最新,否則用該日期(含)之前
+        最後一個有報價的交易日——匯率市場遇假日沒資料,不能只查當天。"""
         if currency in (None, "", "TWD"):
-            return amount
-        if currency not in fx_cache:
-            fx_cache[currency] = _last_close(f"{currency}TWD=X", f"{currency}/TWD 匯率")
-        return amount * fx_cache[currency]
+            return 1.0
+        key = (currency, on_date)
+        if key in fx_cache:
+            return fx_cache[key]
+        sym = f"{currency}TWD=X"
+        if on_date is None:
+            rate = _last_close(sym, f"{currency}/TWD 匯率")
+        else:
+            d = dt.date.fromisoformat(on_date)
+            hist = yf.Ticker(sym).history(
+                start=(d - dt.timedelta(days=10)).isoformat(),
+                end=(d + dt.timedelta(days=1)).isoformat())
+            closes = hist["Close"].dropna() if not hist.empty and "Close" in hist else None
+            if closes is None or closes.empty:
+                raise RuntimeError(f"抓不到 {on_date} 前後的 {currency}/TWD 匯率")
+            rate = float(closes.iloc[-1])
+            if not math.isfinite(rate) or rate <= 0:
+                raise RuntimeError(f"{on_date} 的 {currency}/TWD 匯率不合理:{rate}")
+        fx_cache[key] = rate
+        return rate
+
+    # 同一 ticker 的多列視為分批建倉,合併成一筆部位
+    by_ticker = {}
+    for lot in lots:
+        by_ticker.setdefault(lot["ticker"], []).append(lot)
 
     positions = []
-    for ticker, shares in rows:
+    for ticker, tlots in by_ticker.items():
         tk = yf.Ticker(ticker)
         price_local = _last_close(ticker, f"海外持股 {ticker}")
         currency = (tk.fast_info.get("currency") if hasattr(tk, "fast_info") else None) or "USD"
-        price_twd = to_twd(price_local, currency)
+        price_twd = price_local * fx_rate(currency)
+
+        shares = sum(l["shares"] for l in tlots)
+        # 各批用自己的買進日匯率換台幣後加權平均;任一批沒成本就整檔留空
+        if all(l["cost"] is not None for l in tlots) and shares:
+            total_cost_twd = sum(
+                l["cost"] * fx_rate(currency, l["cost_date"]) * l["shares"] for l in tlots
+            )
+            cost_twd = total_cost_twd / shares
+        else:
+            cost_twd = None
+
         positions.append({
             "code": ticker,
             "shares": shares,
             "price": price_twd,                 # 已換算台幣,與台股同單位
             "market_value": price_twd * shares,
+            "cost_price": cost_twd,
             "name": f"{ticker}({currency} {price_local:,.2f})",
         })
     return {"positions": positions, "settlement_cash": 0.0, "unsettled": 0.0}
