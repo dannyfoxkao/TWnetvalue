@@ -75,7 +75,7 @@ def main():
 
         if acc_cfg["type"] == "fubon_futures":
             try:
-                fut = fetch_fubon_futures(acc_cfg)
+                fut = fetch_fubon_futures(acc_cfg, snap_date)
             except Exception as e:
                 print(f"[錯誤] 帳戶 {name} 抓取失敗:{e}")
                 print("為避免淨值失真(少算一個帳戶),本次中止,不寫入資料。")
@@ -89,7 +89,7 @@ def main():
 
         adapter = ADAPTERS[acc_cfg["type"]]
         try:
-            res = adapter(acc_cfg)
+            res = adapter(acc_cfg, snap_date)
         except Exception as e:
             print(f"[錯誤] 帳戶 {name} 抓取失敗:{e}")
             print("為避免淨值失真(少算一個帳戶),本次中止,不寫入資料。")

@@ -38,7 +38,21 @@ def _read_csv_rows(path):
             " 建議用 UTF-8 重存這個檔案。")
 
 
-def fetch_manual(acc_cfg: dict):
+def _as_date(value):
+    """把 'YYYY-MM-DD' 字串或 date 物件轉成 date;None/格式不符回傳 None。"""
+    if value is None:
+        return None
+    if isinstance(value, dt.datetime):
+        return value.date()
+    if isinstance(value, dt.date):
+        return value
+    try:
+        return dt.date.fromisoformat(str(value)[:10])
+    except ValueError:
+        return None
+
+
+def fetch_manual(acc_cfg: dict, snap_date: str = None):
     """手動持股表:只維護代號+股數,價格交給 FinMind。"""
     path = Path(__file__).parent / acc_cfg["positions_file"]
     positions = []
@@ -60,7 +74,7 @@ def fetch_manual(acc_cfg: dict):
     return {"positions": positions, "settlement_cash": 0.0, "unsettled": 0.0}
 
 
-def fetch_manual_foreign(acc_cfg: dict):
+def fetch_manual_foreign(acc_cfg: dict, snap_date: str = None):
     """海外持股(複委託)手動表:富邦 Neo API 查不到複委託庫存,只能自己維護。
 
     CSV 欄位:ticker, shares, cost, cost_date, note
@@ -175,7 +189,7 @@ def fetch_manual_foreign(acc_cfg: dict):
     return {"positions": positions, "settlement_cash": 0.0, "unsettled": 0.0}
 
 
-def fetch_shioaji(acc_cfg: dict):
+def fetch_shioaji(acc_cfg: dict, snap_date: str = None):
     """永豐 Shioaji:自動抓庫存,含即時價。
 
     CA 憑證原則上是下單簽章用的,查詢不一定需要,但官方 Quickstart 的標準
@@ -226,11 +240,19 @@ def fetch_shioaji(acc_cfg: dict):
         except Exception as e:
             print(f"  [警告] 永豐交割戶餘額抓取失敗,以 0 計:{e}")
 
-        # 未交割款:只算 T+1、T+2(T+0 當天已完成交割,餘額已反映,算了會重複)
+        # 未交割款:取交割日晚於快照日的部分(理由同富邦,見 fetch_fubon)。
+        # 用 settlements() 回傳的 date 欄位判斷,不用 T 值——T 是相對於「執行
+        # 當下」的天數,跨午夜執行時會跟快照代表的交易日對不起來。
         unsettled = 0.0
         try:
+            base = _as_date(snap_date) or dt.date.today()
             for s in api.settlements(api.stock_account):
-                if int(getattr(s, "T", 0)) > 0:
+                sd = _as_date(getattr(s, "date", None))
+                if sd is None:
+                    # 沒有日期就退回用 T 值(T>0 代表尚未交割)
+                    if int(getattr(s, "T", 0)) > 0:
+                        unsettled += float(getattr(s, "amount", 0) or 0)
+                elif sd > base:
                     unsettled += float(getattr(s, "amount", 0) or 0)
         except Exception as e:
             print(f"  [警告] 永豐未交割款抓取失敗,以 0 計:{e}")
@@ -262,7 +284,7 @@ def _fubon_qty(obj):
     return float(qty or 0)
 
 
-def fetch_fubon(acc_cfg: dict):
+def fetch_fubon(acc_cfg: dict, snap_date: str = None):
     """富邦 Neo API:自動抓庫存。需要憑證檔(.pfx)。"""
     from fubon_neo.sdk import FubonSDK  # 延遲載入
 
@@ -320,29 +342,28 @@ def fetch_fubon(acc_cfg: dict):
         except Exception as e:
             print(f"  [警告] 富邦交割戶餘額抓取失敗,以 0 計:{e}")
 
-        # 未交割款:只取交割日「晚於今天」的,也就是還沒扣款的部分。
+        # 未交割款:取交割日「晚於快照日」的,也就是該交易日收盤時還沒交割的。
         # total_settlement_amount 負數=應付(買)、正數=應收(賣);
         # 沒成交的日期整筆欄位都是 None,要略過。
         #
-        # 為什麼是 > today 而不是 >= today:券商在扣款後**不會**把該筆移出
-        # 清單,它是「哪天成交、哪天交割」的歷史紀錄,會留在三天查詢視窗內。
-        # 實測同一筆(08/12 買進、08/14 交割):
-        #   當天 00:47 交割戶 210,146、清單有該筆  → 錢還沒扣,應該算
-        #   當天 22:46 交割戶   9,126、清單仍有該筆 → 錢已扣,不該再算
-        # 因為清單本身分辨不出扣款與否,只能靠「交割日是否已過」判斷,
-        # 而這個判斷成立的前提是**快照在扣款完成後才跑**(見 snapshot.py
-        # 的執行時間檢查)。台股交割扣款約在交割日上午完成。
+        # 基準是 snap_date(這筆快照代表的交易日)而不是 date.today()。
+        # 券商在交割後**不會**把該筆移出清單(它是「哪天成交、哪天交割」的
+        # 歷史紀錄,會留在三天查詢視窗內),所以只能靠日期判斷有沒有交割完。
+        # 用牆上時鐘會壞在跨午夜執行:例如 08/26 收盤的快照在 08/27 凌晨才跑,
+        # 08/25 賣出、08/27 交割的那筆會因為 08/27 > 08/27 不成立而被濾掉,
+        # 但錢那時根本還沒入帳(交割扣付款約在交割日上午),應收款就憑空消失。
+        # 改用 snap_date 後,不論幾點跑,答案都對應同一個交易日的收盤狀態。
         unsettled = 0.0
         try:
             st = sdk.accounting.query_settlement(account, "3d")
             if st.is_success:
-                today = dt.date.today()
+                base = _as_date(snap_date) or dt.date.today()
                 for d in getattr(st.data, "details", []) or []:
                     sd = getattr(d, "settlement_date", None)
                     amt = getattr(d, "total_settlement_amount", None)
                     if not sd or amt is None:
                         continue
-                    if dt.datetime.strptime(sd, "%Y/%m/%d").date() > today:
+                    if dt.datetime.strptime(sd, "%Y/%m/%d").date() > base:
                         unsettled += float(amt)
         except Exception as e:
             print(f"  [警告] 富邦未交割款抓取失敗,以 0 計:{e}")
@@ -353,7 +374,7 @@ def fetch_fubon(acc_cfg: dict):
         sdk.logout()
 
 
-def fetch_fubon_futures(acc_cfg: dict):
+def fetch_fubon_futures(acc_cfg: dict, snap_date: str = None):
     """富邦期貨保證金帳戶:回傳權益數與淨口數。
 
     回傳 {"cash_balance": 本日餘額, "unrealized_pnl": 未實現損益,
