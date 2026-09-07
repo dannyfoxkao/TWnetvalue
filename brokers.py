@@ -113,14 +113,50 @@ def fetch_manual_foreign(acc_cfg: dict, snap_date: str = None):
 
     fx_cache = {}
 
-    def _last_close(tk_symbol, label):
-        """取最後一筆有效收盤價。
+    def _fast_price(tk):
+        """取 yfinance 的即時/最後成交價,拿不到回傳 None。
 
-        yfinance 對「當日進行中」或休市日常回傳 NaN 收盤價,直接取 iloc[-1]
-        會拿到 NaN,一路污染總市值(NaN 不是 None,任何 is None 檢查都抓不到,
-        最後在寫入資料庫時才以難懂的 NOT NULL 錯誤爆掉)。先 dropna 再取。
+        FastInfo 在不同版本的存取方式不一致(dict 風格用 'lastPrice',
+        屬性風格用 last_price),而且可能其中一種回 None,所以全部試一遍。
         """
-        hist = yf.Ticker(tk_symbol).history(period="10d")
+        try:
+            fi = tk.fast_info
+        except Exception:
+            return None
+        for get in (lambda: fi["lastPrice"],
+                    lambda: fi.get("lastPrice"),
+                    lambda: getattr(fi, "last_price", None)):
+            try:
+                v = get()
+            except Exception:
+                continue
+            if v is None:
+                continue
+            try:
+                v = float(v)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(v) and v > 0:
+                return v
+        return None
+
+    def _last_close(tk_symbol, label):
+        """取最新價格:優先即時報價,歷史收盤檔當後備。
+
+        Yahoo 的**歷史收盤檔更新很慢** —— 當日收盤後那一列的 Close 可能仍是
+        NaN(實測日股收盤後數小時仍為空),dropna 後就退回前一個交易日,
+        導致整份快照的海外持股永遠慢一個交易日。但 fast_info 的即時報價
+        當下就有值,所以先讀它。
+
+        歷史檔仍需保留當後備:fast_info 偶爾會拿不到(冷門標的、Yahoo 限流)。
+        取歷史檔時一樣要先 dropna——NaN 不是 None,任何 is None 檢查都抓不到,
+        會一路污染總市值,最後在寫入資料庫時才以難懂的 NOT NULL 錯誤爆掉。
+        """
+        tk = yf.Ticker(tk_symbol)
+        val = _fast_price(tk)
+        if val is not None:
+            return val
+        hist = tk.history(period="10d")
         if hist.empty or "Close" not in hist:
             raise RuntimeError(f"{label} 抓不到報價({tk_symbol})")
         closes = hist["Close"].dropna()
@@ -129,6 +165,8 @@ def fetch_manual_foreign(acc_cfg: dict, snap_date: str = None):
         val = float(closes.iloc[-1])
         if not math.isfinite(val) or val <= 0:
             raise RuntimeError(f"{label} 取得的價格不合理:{val}({tk_symbol})")
+        print(f"  [提醒] {label} 用歷史收盤檔({tk_symbol}),即時報價取不到,"
+              f"可能落後一個交易日")
         return val
 
     def fx_rate(currency, on_date=None):
