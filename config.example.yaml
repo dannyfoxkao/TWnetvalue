@@ -41,15 +41,17 @@ accounts:
   #   小型台灣50 ETF 期貨(FISRF)= 每口 1000 單位
   #   小型個股期貨(如小台達電 FIRVF)= 每口 100 股
   # 全部套同一個乘數會把個股期貨的部位價值放大 10 倍。
-  # key 用 query_single_position() 回傳的 symbol(不含月份);沒列到的商品
-  # 會用 default_multiplier 並在執行時印警告,提醒你補設定。
+  # key 用 query_single_position() 回傳的 symbol(不含月份)。
+  # 刻意沒有預設乘數:持有沒列到的商品時快照會中止,並提示要補的代號與
+  # 反推的乘數(乘數 = 損益 ÷ (市價 − 成本) ÷ 口數)。寧可缺一天資料,
+  # 也不要默默套錯乘數、寫進錯好幾倍的部位價值。
   fubon_futures:
     type: fubon_futures
     enabled: false
     multipliers:
-      FISRF: 1000
-      FIRVF: 100
-    default_multiplier: 100
+      FISRF: 1000    # 小型台灣50 ETF 期貨,每口 1000 單位
+      FIRVF: 100     # 小型個股期貨,每口 100 股
+      FITM: 10       # 微型台指期貨,每點 10 元
 
   # 手動持股表(沒有券商 API 時用這個)
   # 只需要維護代號和股數,收盤價每天自動抓。cost 欄位選填(均價成本)。

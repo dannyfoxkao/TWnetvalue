@@ -467,13 +467,32 @@ def fetch_fubon_futures(acc_cfg: dict, snap_date: str = None):
         # 每筆部位自帶 market_price = 期貨即時報價,直接拿它算實質價值,
         # 不必用現股收盤價替代,沒有基差誤差。
         #
-        # 乘數必須「逐商品」查表:不同期貨契約規格不同
-        # (小型台灣50 ETF 期貨 1 口 = 1000 單位;小型個股期貨 1 口 = 100 股),
-        # 全部套同一個乘數會把個股期貨的部位價值放大 10 倍。
+        # 乘數必須「逐商品」查表:不同期貨契約規格差很多
+        # (小型台灣50 ETF 期貨 1 口 = 1000 單位;小型個股期貨 1 口 = 100 股;
+        # 微型台指期貨 1 點 = 10 元),套錯就是好幾倍的誤差。
+        #
+        # 刻意**沒有預設乘數**:曾經有 default_multiplier,結果新建倉的微台指
+        # (實際 10)被默默套成 100,部位價值灌成 10 倍,曝險倍數跟著膨脹成
+        # 好幾倍。程式雖有印警告,但排程在背景跑沒人看得到。現在遇到沒設定的
+        # 商品直接中止,並用券商回報的損益反推乘數當提示。
         mult_map = acc_cfg.get("multipliers") or {}
-        default_mult = acc_cfg.get("default_multiplier")
+
+        def _mult_hint(p, symbol):
+            """乘數 = 損益 ÷ (市價 − 成本) ÷ 口數;剛建倉沒有價差時無法反推。"""
+            try:
+                pnl = float(getattr(p, "profit_or_loss", 0) or 0)
+                diff = (float(getattr(p, "market_price", 0) or 0)
+                        - float(getattr(p, "price", 0) or 0))
+                n = float(getattr(p, "orig_lots", 0) or 0)
+                if pnl and diff and n:
+                    return f"{symbol}: {round(abs(pnl / (diff * n)), 2):g}    # 依券商損益反推"
+            except (TypeError, ValueError):
+                pass
+            return f"{symbol}: ?    # 剛建倉無價差可反推,請查契約規格"
+
         net_lots = 0.0
         notional = 0.0
+        missing = []
         pos_result = sdk.futopt_accounting.query_single_position(futures_acc)
         if not pos_result.is_success:
             raise RuntimeError(f"富邦期貨未平倉查詢失敗: {pos_result.message}")
@@ -483,20 +502,18 @@ def fetch_fubon_futures(acc_cfg: dict, snap_date: str = None):
                 lots = -lots
             net_lots += lots
             symbol = str(getattr(p, "symbol", "") or "")
-            if symbol in mult_map:
-                mult = float(mult_map[symbol])
-            elif default_mult is not None:
-                mult = float(default_mult)
-                print(f"  [警告] 期貨商品 {symbol} 不在 multipliers 設定中,"
-                      f"暫用 default_multiplier={mult:g};請到 config.yaml 補上正確乘數")
-            else:
-                raise RuntimeError(
-                    f"期貨商品 {symbol} 沒有設定契約乘數。請在 config.yaml 的 "
-                    f"fubon_futures.multipliers 加上 {symbol},或設 default_multiplier。"
-                )
+            if symbol not in mult_map:
+                missing.append(_mult_hint(p, symbol))
+                continue
             mkt = getattr(p, "market_price", None)
             if mkt:
-                notional += float(mkt) * mult * lots
+                notional += float(mkt) * float(mult_map[symbol]) * lots
+        if missing:
+            raise RuntimeError(
+                "有期貨商品沒設定契約乘數,為避免寫入錯誤的部位價值,本次中止。\n"
+                "  請在 config.yaml 的 fubon_futures.multipliers 補上:\n"
+                + "\n".join(f"    {m}" for m in dict.fromkeys(missing))
+            )
 
         return {
             "cash_balance": cash_balance,
