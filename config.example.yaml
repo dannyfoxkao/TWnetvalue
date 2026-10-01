@@ -60,6 +60,16 @@ accounts:
     enabled: true
     positions_file: positions_manual.csv
 
+  # 出借中(借券)的股票:股票還是你的,但券商 API 查不到。
+  # 永豐 Shioaji 沒有任何借券查詢介面(整個 api 沒有 lend/borrow/sbl 方法),
+  # list_positions 只回傳未出借的部分,出借中的部位會整個消失,淨值憑空少一截。
+  # 格式同 positions_manual.csv,只要維護代號和股數。
+  # ⚠️ 還券後務必刪掉該行,否則會跟券商回報的庫存重複計算。
+  sinopac_lent:
+    type: manual
+    enabled: false
+    positions_file: positions_lent.csv
+
   # 海外持股(複委託):富邦 Neo API 查不到複委託庫存,只能手動維護股數。
   # ticker 用 Yahoo Finance 代號(日股加 .T,美股直接寫),
   # 價格與匯率由 yfinance 自動抓並換算台幣。

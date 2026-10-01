@@ -12,6 +12,7 @@ config.yaml
 # 實際持股(範本見 positions_*.example.csv)
 positions_manual.csv
 positions_foreign.csv
+positions_lent.csv
 # 完整持股與淨值歷史
 networth.db
 # 券商憑證檔

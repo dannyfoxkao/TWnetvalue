@@ -46,6 +46,66 @@ def check_run_time(force: bool):
     sys.exit(1)
 
 
+def check_asset_flow(conn, snap_date, all_positions, broker_cash, unsettled, debt,
+                     net_value):
+    """偵測「資產憑空消失或出現」:持股變動與現金變動對不起來就示警。
+
+    賣掉 X 元的股票,交割戶或未交割款就該多 X 元;買進則相反。對不上的差額
+    代表有東西沒被記錄到。這類錯誤最難發現,因為每個數字單獨看都正常:
+      - 出借(借券):券商庫存少了,但那是你的股票,錢不會進來
+      - 海外持股沒更新 CSV:錢扣了,但買到的股票沒出現
+      - 跨午夜執行:應收款被日期條件濾掉,錢卻還沒入帳
+
+    期貨不納入比較:它的閒置現金會隨部位實質價值大幅跳動,算進來會一直誤報。
+    """
+    row = conn.execute(
+        "SELECT date, COALESCE(broker_cash, 0), COALESCE(unsettled, 0), debt"
+        " FROM totals WHERE date < ? ORDER BY date DESC LIMIT 1", (snap_date,)
+    ).fetchone()
+    if not row:
+        return
+    pdate, pbroker, punsettled, pdebt = row
+
+    prev_sh = dict(conn.execute(
+        "SELECT code, SUM(shares) FROM positions WHERE date=? GROUP BY code", (pdate,)))
+    cur_sh, px_map = {}, {}
+    for p in all_positions:
+        cur_sh[p["code"]] = cur_sh.get(p["code"], 0.0) + p["shares"]
+        px_map[p["code"]] = p["price"]
+
+    traded, moved = 0.0, []
+    for code in set(prev_sh) | set(cur_sh):
+        delta = cur_sh.get(code, 0.0) - prev_sh.get(code, 0.0)
+        if abs(delta) < 1e-9:
+            continue
+        px = px_map.get(code)
+        if px is None:      # 整檔出清,今天沒有價格,改用前一日單價估算
+            r = conn.execute("SELECT MAX(price) FROM positions WHERE date=? AND code=?",
+                             (pdate, code)).fetchone()
+            px = (r[0] if r and r[0] else 0.0)
+        traded += delta * px        # 買進為正、賣出為負
+        moved.append((code, delta, delta * px))
+
+    cash_side = (broker_cash + unsettled) - (pbroker + punsettled)
+    debt_side = debt - pdebt        # 借款增加會讓現金增加,不算異常
+    residual = cash_side + traded - debt_side
+    if abs(residual) <= max(10000.0, abs(net_value) * 0.01):
+        return
+
+    print("-" * 46)
+    print(f"[注意] 持股變動與現金對不起來(vs {pdate}),差額 {residual:+,.0f}")
+    for code, d, v in sorted(moved, key=lambda x: -abs(x[2]))[:5]:
+        print(f"    {code} 股數 {d:+,.0f}(約 {v:+,.0f})")
+    print(f"    交割戶+未交割款 {cash_side:+,.0f}、負債 {debt_side:+,.0f}")
+    if residual < 0:
+        print("    資產少了但錢沒進來。可能原因:股票被出借(借券)、海外持股")
+        print("    買了沒更新 CSV、或資金轉出到沒追蹤的帳戶。")
+    else:
+        print("    錢多了但沒有對應的賣出。可能原因:股息入帳、借款撥入、")
+        print("    或資金從沒追蹤的帳戶轉入。")
+    print("    這只是提醒,資料仍會寫入;確認無誤可忽略。")
+
+
 def main():
     check_run_time("--force" in sys.argv)
     load_dotenv(ROOT / ".env")
@@ -184,6 +244,8 @@ def main():
     )
     if futures_values:
         db.save_futures_snapshot(conn, snap_date, futures_values)
+    check_asset_flow(conn, snap_date, all_positions, broker_cash, unsettled, debt,
+                     net_value)
 
     # 7. 摘要
     mv = market_value
