@@ -306,6 +306,15 @@ def fetch_shioaji(acc_cfg: dict, snap_date: str = None):
             print(f"  [警告] 永豐 logout 失敗(不影響已抓到的資料):{logout_err}")
 
 
+def _is_no_data(message) -> bool:
+    """判斷券商回應是不是「查無資料」而非真正的查詢失敗。
+
+    富邦在空手時會回 is_success=False、message='查無任何資料',把「沒有部位」
+    當成錯誤回報。空手是完全正常的狀態,不該讓整份快照中止。
+    """
+    return any(k in str(message or "") for k in ("查無", "無任何資料", "無資料"))
+
+
 def _fubon_qty(obj):
     """取富邦庫存物件的「當前」股數,一律以 today_qty(今日庫存)為準。
 
@@ -341,7 +350,14 @@ def fetch_fubon(acc_cfg: dict, snap_date: str = None):
         account = accounts.data[0]
         result = sdk.accounting.inventories(account)
         if not result.is_success:
-            raise RuntimeError(f"富邦庫存查詢失敗: {result.message}")
+            # 同期貨:庫存清空時富邦也回「查無任何資料」。這裡沒有保證金那種
+            # 交叉驗證,所以印警告讓它看得見;真的整戶賣光時,snapshot.py 的
+            # 資產流向防呆也會因為持股歸零而示警。
+            if _is_no_data(result.message):
+                print("  [警告] 富邦證券庫存回報「查無任何資料」,視為空手。")
+                result = None
+            else:
+                raise RuntimeError(f"富邦庫存查詢失敗: {result.message}")
         # 成本均價:inventories() 沒有成本欄位,要另外查未實現損益,
         # 以 stock_no 對應回庫存。
         cost_map = {}
@@ -356,7 +372,7 @@ def fetch_fubon(acc_cfg: dict, snap_date: str = None):
             print(f"  [警告] 富邦成本查詢失敗,成本欄位留空:{e}")
 
         positions = []
-        for inv in result.data:
+        for inv in ((result.data or []) if result is not None else []):
             # 整股(集保)股數在頂層;零股股數包在巢狀的 inv.odd 子物件裡,
             # 兩者結構相同(today_qty/lastday_qty),必須分開讀再加總,
             # 不然像定期定額買到的零股會整個漏算。
@@ -494,9 +510,18 @@ def fetch_fubon_futures(acc_cfg: dict, snap_date: str = None):
         notional = 0.0
         missing = []
         pos_result = sdk.futopt_accounting.query_single_position(futures_acc)
+        pos_rows = pos_result.data or []
         if not pos_result.is_success:
-            raise RuntimeError(f"富邦期貨未平倉查詢失敗: {pos_result.message}")
-        for p in pos_result.data or []:
+            # 全部平倉時富邦回 is_success=False、message='查無任何資料'。
+            # 空手是正常狀態,但不能無條件忽略失敗——用原始保證金交叉驗證:
+            # 真的有未平倉部位時 initial_margin 不會是 0,所以真正的查詢失敗
+            # 仍然會中止,不會被誤判成空手而把部位靜靜地算成 0。
+            if _is_no_data(pos_result.message) and not float(
+                    getattr(data, "initial_margin", 0) or 0):
+                pos_rows = []
+            else:
+                raise RuntimeError(f"富邦期貨未平倉查詢失敗: {pos_result.message}")
+        for p in pos_rows:
             lots = float(getattr(p, "orig_lots", 0) or 0)
             if str(getattr(p, "buy_sell", "")).lower().endswith("sell"):
                 lots = -lots
